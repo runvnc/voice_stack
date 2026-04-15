@@ -1,0 +1,105 @@
+# Optimized stage config for Qwen3-TTS.
+# Using vllm-omni commit 6a45efb287ef (2026-03-05, pre-PR #1617).
+# At this commit, enforce_eager: false works on BOTH stages without the
+# make_omni_output tuple error that PR #1617 introduced.
+# Stage 0 (Talker): enforce_eager: false - vLLM engine-level CUDA graphs.
+# Stage 1 (Code2Wav): enforce_eager: false - CUDAGraphDecoderWrapper active.
+# Lorimi team validated 164ms TTFA on RTX 3090 with this exact config.
+async_chunk: true
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    is_comprehension: true
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: qwen3_tts
+      max_num_seqs: 2
+      model_arch: Qwen3TTSTalkerForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      enforce_eager: false
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: latent
+      # vLLM v0.18 upfront check: free_memory >= gpu_memory_utilization * total_GPU
+      # Free = ~18 GiB, total = 139.8 GiB. Max allowed = 18/139.8 = 0.129.
+      # KV cache formula only counts THIS process's memory, so 0.08 gives ~6.8 GiB for KV cache.
+      gpu_memory_utilization: 0.08
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 512
+      max_model_len: 2048
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_async_chunk
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 2048
+      seed: 42
+      detokenize: false
+      repetition_penalty: 1.05
+      stop_token_ids: [2150]
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: code2wav
+      max_num_seqs: 1
+      model_arch: Qwen3TTSCode2Wav
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      # enforce_eager: false enables CUDAGraphDecoderWrapper for Code2Wav.
+      # This works at commit 6a45efb (pre-#1617). PR #1617 broke this with
+      # a make_omni_output tuple error. ~26% latency improvement.
+      enforce_eager: false
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: audio
+      # Stage 0 takes ~11 GiB, leaving ~7 GiB. 0.04 * 139.8 = 5.6 GiB <= 7 GiB free.
+      gpu_memory_utilization: 0.04
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 8192
+      max_model_len: 8192
+    engine_input_source: [0]
+    final_output: true
+    final_output_type: audio
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    tts_args:
+      max_instructions_length: 500
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 8192
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.0
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
+
+  connectors:
+    connector_of_shared_memory:
+      name: SharedMemoryConnector
+      extra:
+        shm_threshold_bytes: 65536
+        codec_streaming: true
+        connector_get_sleep_s: 0.01
+        connector_get_max_wait_first_chunk: 3000
+        connector_get_max_wait: 300
+        codec_chunk_frames: 25
+        codec_left_context_frames: 25
+
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1

@@ -1,0 +1,64 @@
+# Stage config for CosyVoice3 on H200 shared with Qwen3.5-35B-A3B-AWQ LLM.
+# Model: FunAudioLLM/Fun-CosyVoice3-0.5B-2512
+# Stage 0: Talker (text -> speech tokens via Qwen2.5-0.5B LLM backbone)
+# Stage 1: Code2Wav (chunk-aware causal flow matching -> waveform)
+#
+# Memory layout (H200, 143.7 GiB total):
+#   LLM (Qwen3.5-35B-A3B-AWQ): 0.85 * 143.7 = ~122 GiB
+#   Free after LLM: ~21 GiB
+#   Stage 0 budget: 0.12 * 143.7 = ~17.2 GiB  (fits in 21 GiB free) ✓
+#   Stage 1 budget: 0.04 * 143.7 = ~5.7 GiB   (vLLM check uses free at process
+#                                                start, before Stage 0 allocates) ✓
+#
+# IMPORTANT: enforce_eager: true is REQUIRED for Stage 1.
+# CosyVoice3's flow matching decoder uses dynamic conv shapes that are
+# fundamentally incompatible with CUDA graphs. This is NOT a bug to fix.
+#
+# dtype: float32 is REQUIRED for both stages - CosyVoice3 needs full precision.
+# (Unlike Qwen3-TTS which can run in auto/bf16.)
+#
+# NOTE: initial_codec_chunk_frames / codec_chunk_frames do NOT apply here.
+# CosyVoice3 uses flow matching, not codec-based generation, so the
+# Qwen3-TTS TTFA trick is not available. Expect higher TTFA than Qwen3-TTS
+# with initial_codec_chunk_frames=2.
+
+stage_args:
+  - stage_id: 0
+    is_comprehension: true
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: cosyvoice3_talker
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      model_arch: CosyVoice3Model
+      trust_remote_code: true
+      gpu_memory_utilization: 0.12
+      engine_output_type: latent
+      disable_hybrid_kv_cache_manager: true
+      enable_prefix_caching: false
+      enforce_eager: true
+      mm_processor_cache_gb: 0
+      skip_mm_profiling: true
+      dtype: "float32"
+
+  - stage_id: 1
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: cosyvoice3_code2wav
+      model_arch: CosyVoice3Model
+      trust_remote_code: true
+      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      engine_output_type: latent
+      gpu_memory_utilization: 0.04
+      enforce_eager: true
+      disable_hybrid_kv_cache_manager: true
+      enable_prefix_caching: false
+      skip_mm_profiling: true
+      dtype: "float32"
+    engine_input_source: [0]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.cosyvoice3.text2flow
+    final_output: true
+    final_output_type: audio

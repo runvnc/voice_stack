@@ -1,0 +1,53 @@
+# Qwen3-TTS config for groxaxo OpenAI-FastAPI server (optimized backend)
+# Place at /root/qwen3-tts/config.yaml inside the container.
+#
+# The optimized backend uses torch.compile + CUDA graphs for best latency.
+# It reads this config to know which models to load and switch between.
+#
+# default_model: CustomVoice for built-in voices (Vivian, etc.)
+# The backend auto-switches to Base model when it receives clone: requests.
+
+default_model: 0.6B-CustomVoice
+
+models:
+  0.6B-Base:
+    hf_id: Qwen/Qwen3-TTS-12Hz-0.6B-Base
+    type: base
+
+  0.6B-CustomVoice:
+    hf_id: Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
+    type: customvoice
+
+  1.7B-Base:
+    hf_id: Qwen/Qwen3-TTS-12Hz-1.7B-Base
+    type: base
+
+  1.7B-CustomVoice:
+    hf_id: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+    type: customvoice
+
+optimization:
+  # flash_attention_2 requires flash-attn installed (added to Dockerfile).
+  # Falls back to sdpa automatically if not available.
+  attention: flash_attention_2
+
+  # torch.compile for faster inference after warmup
+  use_compile: true
+  compile_mode: reduce-overhead  # faster compile than max-autotune, good for inference
+
+  # CUDA graphs: significant speedup for fixed-shape inference on H200
+  use_cuda_graphs: true
+
+  use_fast_codebook: true
+  compile_codebook_predictor: true
+
+  streaming:
+    # decode_window_frames: how many frames to buffer before decoding.
+    # 80 = ~6.7s audio window (fine for H200 with plenty of VRAM)
+    decode_window_frames: 80
+
+    # emit_every_frames: yield audio to client every N codec frames.
+    # At 12Hz codec rate: 1 frame = ~83ms audio, 2 = ~167ms, 6 = ~500ms.
+    # Lower = lower TTFA (time to first audio), higher = better RTF.
+    # 2 gives ~167ms audio chunks with very low TTFA.
+    emit_every_frames: 2
