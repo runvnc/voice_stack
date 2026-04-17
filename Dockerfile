@@ -39,6 +39,13 @@ ENV TORCHINDUCTOR_CACHE_DIR=/workspace/torchinductor_cache
 # =============================================================================
 FROM base AS with-omni
 
+# Configure apt to retry on network failures (Ubuntu mirrors can be flaky)
+RUN echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/99retries && \
+    echo 'Acquire::http::Timeout "120";' >> /etc/apt/apt.conf.d/99retries && \
+    echo 'Acquire::https::Timeout "120";' >> /etc/apt/apt.conf.d/99retries && \
+    sed -i 's|http://archive.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list && \
+    sed -i 's|http://security.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list
+
 # ffmpeg required by librosa (used internally by vllm-omni for audio)
 # git required for any pip installs from source if needed
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg sox libsox-dev git ca-certificates \
@@ -105,6 +112,14 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir "transformers==4.57.3"
 
 # =============================================================================
+# Stage 3d: Separate venv for Cohere Transcribe with native transformers>=5.4.0
+# Uses --system-site-packages to inherit torch/cuda/scipy from base image.
+# Only transformers (and its direct deps) are overridden in this venv.
+# =============================================================================
+RUN python3 -m venv /opt/cohere-venv --system-site-packages && \
+    /opt/cohere-venv/bin/pip install --no-cache-dir "transformers>=5.4.0" sentencepiece protobuf
+
+# =============================================================================
 # Stage 4: Final image - copy configs and set up runtime
 # =============================================================================
 FROM with-omni AS final
@@ -143,3 +158,47 @@ EXPOSE 8881
 # Set TTS_BACKEND=cosyvoice3 in RunPod pod env to use CosyVoice3.
 # Set TTS_BACKEND=qwen3tts for vllm-omni backend.
 CMD ["/start.sh"]
+
+# =============================================================================
+# Stage 5: Mindroot voice agent platform
+# Installed via pip; plugins pre-installed at build time from GitHub.
+# Runs on port 8010. All backend services on localhost (no network round trip).
+#
+# Plugins installed:
+#   runvnc/mr_sip       - SIP/voice call handling (v2 + silero_cohere STT)
+#   runvnc/ah_openrouter - OpenRouter LLM backend
+#   runvnc/mr_qwen3tts  - Qwen3-TTS plugin (openai backend -> localhost:8880)
+# =============================================================================
+FROM final AS with-mindroot
+
+# Create Mindroot runtime directory structure
+RUN mkdir -p /app/imgs /app/data/chat /app/models /app/static/personas \
+    /app/personas/local /app/personas/shared /app/data/sessions
+
+WORKDIR /app
+
+# Create isolated venv and install Mindroot from PyPI
+RUN python3 -m venv /app/.venv && \
+    /app/.venv/bin/pip install --no-cache-dir mindroot
+
+# Pre-install plugins at build time
+RUN /app/.venv/bin/mindroot plugin install \
+    runvnc/mr_sip \
+    runvnc/ah_openrouter \
+    runvnc/mr_qwen3tts \
+    runvnc/mr_any_llm
+
+# Mindroot env vars - all backend services on localhost (eliminates network round trip)
+ENV ANY_LLM_SERVER_URL=http://localhost:8000/v1
+ENV MR_QWEN3TTS_BACKEND=openai
+ENV MR_QWEN3TTS_OPENAI_URL=http://localhost:8880
+ENV STT_PROVIDER=silero_cohere
+ENV COHERE_TRANSCRIBE_URL=http://localhost:8881
+ENV SILERO_MIN_SILENCE_MS=400
+ENV ANY_LLM_EXTRA_PARAMS='{"extra_body": {"chat_template_kwargs": {"enable_thinking": false}}}'
+# Credentials - override at runtime via RunPod env vars
+ENV JWT_SECRET_KEY=change_me_at_runtime
+ENV ADMIN_USER=admin
+ENV ADMIN_PASS=change_me_at_runtime
+
+EXPOSE 8010

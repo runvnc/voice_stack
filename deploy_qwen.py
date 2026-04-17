@@ -1,6 +1,7 @@
 import os
 import time
 import argparse
+import secrets
 import sys
 import re
 import json
@@ -16,11 +17,23 @@ def check_env_vars():
         print(f"Error: Missing required environment variables: {', '.join(missing)}")
         sys.exit(1)
 
+def check_sip_env_vars():
+    """Check SIP env vars required for deploy (passed into container)."""
+    required = ["SIP_USER", "SIP_PASSWORD", "SIP_GATEWAY"]
+    missing = [var for var in required if not os.getenv(var)]
+    if missing:
+        print(f"Error: Missing SIP environment variables required for deploy: {', '.join(missing)}")
+        print(f"  Set these before deploying: SIP_USER, SIP_PASSWORD, SIP_GATEWAY")
+        sys.exit(1)
+
 # Configuration
 RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
 DOCKER_USER = os.getenv("DOCKER_USER")
 HF_TOKEN = os.getenv("HF_TOKEN")
 REGISTRY_AUTH_ID = os.getenv("RUNPOD_REGISTRY_AUTH_ID")
+SIP_USER = os.getenv("SIP_USER")
+SIP_PASSWORD = os.getenv("SIP_PASSWORD")
+SIP_GATEWAY = os.getenv("SIP_GATEWAY")
 POD_BASE_NAME = "vLLM-Inference"
 STATE_FILE = Path(__file__).parent / "pod_state.json"
 
@@ -113,19 +126,35 @@ def get_or_create_template(model_repo, max_len, image_name, tts_backend="qwen3tt
         "container_disk_in_gb": 50,
         "volume_in_gb": 120,
         "volume_mount_path": "/workspace",
-        "ports": "8000/http,8091/http,8765/tcp,8880/http,8881/http",
+        "ports": "8000/http,8091/http,8765/tcp,8880/http,8881/http,8010/http",
         "env": {
             "HF_HOME": "/workspace/huggingface",
             "VLLM_ATTENTION_BACKEND": "FLASHINFER",
             "HF_TOKEN": HF_TOKEN,
             "TTS_BACKEND": tts_backend,
             "STT_PROVIDER": "silero_cohere",
-            "SILERO_MIN_SILENCE_MS": "400"
+            "SILERO_MIN_SILENCE_MS": "400",
+            "ANY_LLM_SERVER_URL": "http://localhost:8000/v1",
+            "SIP_USER": SIP_USER,
+            "SIP_PASSWORD": SIP_PASSWORD,
+            "SIP_GATEWAY": SIP_GATEWAY,
         }
     }
 
     if REGISTRY_AUTH_ID:
         template_args["container_registry_auth_id"] = REGISTRY_AUTH_ID
+
+    # Auto-generate Mindroot credentials
+    template_args["env"]["JWT_SECRET_KEY"] = secrets.token_hex(32)
+    template_args["env"]["ADMIN_USER"] = "admin_" + secrets.token_hex(4)
+    template_args["env"]["ADMIN_PASS"] = secrets.token_urlsafe(16)
+
+    # Save credentials locally so we can display them later
+    # (RunPod pod API does not return env vars)
+    state = load_pod_state()
+    state['mindroot_creds'] = {'ADMIN_USER': template_args["env"]["ADMIN_USER"],
+                               'ADMIN_PASS': template_args["env"]["ADMIN_PASS"]}
+    save_pod_state(state)
 
     new_template = runpod.create_template(**template_args)
     return new_template['id']
@@ -189,6 +218,18 @@ def print_stt_info(pod_id):
     print(f"     STT_PROVIDER=silero_cohere")
     print(f"     COHERE_TRANSCRIBE_URL=https://{pod_id}-8881.proxy.runpod.net")
     print(f"     SILERO_MIN_SILENCE_MS=400")
+
+def print_mindroot_info(pod_id, env=None):
+    """Print Mindroot endpoint and credentials."""
+    if env is None:
+        state = load_pod_state()
+        env = state.get('mindroot_creds') or {}
+    print(f"   Mindroot: https://{pod_id}-8010.proxy.runpod.net")
+    print(f"   Admin UI: https://{pod_id}-8010.proxy.runpod.net/admin")
+    print(f"   Credentials:")
+    print(f"     ADMIN_USER={env.get('ADMIN_USER', '(see pod_state.json)')}")
+    print(f"     ADMIN_PASS={env.get('ADMIN_PASS', '(see pod_state.json)')}")
+
 
 def get_pod_status(pod_id):
     try:
@@ -257,13 +298,15 @@ def start_pod(pod_id=None, tts_backend=None):
             url = f"https://{pod_id}-8000.proxy.runpod.net/health"
             try:
                 r = requests.get(url, timeout=5)
-                if r.status_code == 200:
-                    print(f"\nLIVE: https://{pod_id}-8000.proxy.runpod.net/v1")
-                    print_tts_info(pod_id, tts_backend, runpod.get_pod(pod_id))
-                    print_stt_info(pod_id)
-                    break
+                is_live = r.status_code == 200
             except Exception:
-                pass
+                is_live = False
+            if is_live:
+                print(f"\nLIVE: https://{pod_id}-8000.proxy.runpod.net/v1")
+                print_tts_info(pod_id, tts_backend, p)
+                print_stt_info(pod_id)
+                print_mindroot_info(pod_id)
+                break
         sys.stdout.write("."); sys.stdout.flush()
         time.sleep(15)
 
@@ -292,13 +335,15 @@ def deploy_pod(args, tid):
             url = f"https://{pod_id}-8000.proxy.runpod.net/health"
             try:
                 r = requests.get(url, timeout=5)
-                if r.status_code == 200:
-                    print(f"\nLIVE: https://{pod_id}-8000.proxy.runpod.net/v1")
-                    print_tts_info(pod_id, args.tts_backend, runpod.get_pod(pod_id))
-                    print_stt_info(pod_id)
-                    break
+                is_live = r.status_code == 200
             except Exception:
-                pass
+                is_live = False
+            if is_live:
+                print(f"\nLIVE: https://{pod_id}-8000.proxy.runpod.net/v1")
+                print_tts_info(pod_id, args.tts_backend, p)
+                print_stt_info(pod_id)
+                print_mindroot_info(pod_id)
+                break
         sys.stdout.write("."); sys.stdout.flush()
         time.sleep(15)
 
@@ -331,6 +376,7 @@ def status_pod(pod_id=None):
     print(f"   LLM endpoint:  https://{pod_id}-8000.proxy.runpod.net/v1")
     print_tts_info(pod_id, tts_backend, pod)
     print_stt_info(pod_id)
+    print_mindroot_info(pod_id, pod.get('env', {}))
 
     if pod.get('runtime') and pod.get('address'):
         print(f"Running:")
@@ -426,6 +472,7 @@ def main():
             else:
                 print(f"Saved pod {saved_id} no longer exists, creating new...")
 
+        check_sip_env_vars()
         # No saved pod or it doesn't exist - deploy new
         tid = get_or_create_template(args.model, args.len, args.image, args.tts_backend)
         deploy_pod(args, tid)

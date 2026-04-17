@@ -145,7 +145,7 @@ echo "[start.sh] supervisord.conf assembled. Starting supervisord..."
 cat >> /etc/supervisord.conf << 'EOF'
 
 [program:cohere-transcribe]
-command=python3 /app/cohere_transcribe_server.py --host 0.0.0.0 --port 8881
+command=/opt/cohere-venv/bin/python3 /app/cohere_transcribe_server.py --host 0.0.0.0 --port 8881
 autostart=true
 autorestart=true
 startretries=3
@@ -157,6 +157,28 @@ stderr_logfile=/workspace/logs/cohere_transcribe.err
 stderr_logfile_maxbytes=50MB
 stderr_logfile_backups=3
 environment=HF_HOME="/workspace/huggingface",CUDA_VISIBLE_DEVICES="0"
+EOF
+
+# =============================================================================
+# Mindroot voice agent platform (always started, port 8010)
+# All backend services on localhost - no network round trip for STT/TTS/LLM.
+# Credentials (JWT_SECRET_KEY, ADMIN_USER, ADMIN_PASS) set via RunPod env vars.
+# =============================================================================
+cat >> /etc/supervisord.conf << 'EOF'
+
+[program:mindroot]
+command=/app/.venv/bin/python -m mindroot.server --port 8010
+directory=/app
+autostart=true
+autorestart=true
+startretries=3
+stopwaitsecs=30
+stdout_logfile=/workspace/logs/mindroot.log
+stdout_logfile_maxbytes=100MB
+stdout_logfile_backups=5
+stderr_logfile=/workspace/logs/mindroot.err
+stderr_logfile_maxbytes=100MB
+stderr_logfile_backups=5
 EOF
 
 exec supervisord -c /etc/supervisord.conf
