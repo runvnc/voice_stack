@@ -101,15 +101,25 @@ def load_model():
                 f'(buckets: {ENCODER_BUCKETS})...')
     _model.model.encoder = torch.compile(_model.model.encoder, mode='reduce-overhead')
 
-    # Compile each decoder layer with dynamic=True.
-    # dynamic=True handles variable-length generation without recompilation.
-    # Per-layer compilation reduces Python + kernel launch overhead per decode step.
-    decoder_layers = _model.model.decoder.layers
-    logger.info(f'Compiling {len(decoder_layers)} decoder layers with torch.compile(dynamic=True)...')
-    for layer in decoder_layers:
-        layer.forward = torch.compile(layer.forward, dynamic=True)
+    # Static KV cache + full model compile for decoder acceleration.
+    # Static cache pre-allocates KV tensors so torch.compile can capture
+    # the entire decode step as a CUDA graph (no dynamic allocation per token).
+    logger.info('Configuring static KV cache for decoder acceleration...')
+    _model.generation_config.cache_implementation = 'static'
+    _model.generation_config.max_new_tokens = 64
 
-    # Compile the mel filterbank if accessible (reduces feature extraction overhead)
+    # Compile the full model forward. fullgraph=True enables maximum CUDA graph
+    # coverage; fall back to fullgraph=False if graph breaks occur.
+    try:
+        logger.info('Compiling model.forward with fullgraph=True...')
+        _model.forward = torch.compile(_model.forward, mode='reduce-overhead', fullgraph=True)
+        logger.info('model.forward compiled with fullgraph=True')
+    except Exception as e:
+        logger.warning(f'fullgraph=True failed ({e}), falling back to fullgraph=False...')
+        _model.forward = torch.compile(_model.forward, mode='reduce-overhead', fullgraph=False)
+        logger.info('model.forward compiled with fullgraph=False')
+
+    # Compile the mel filterbank if accessible
     try:
         filterbank = _processor.feature_extractor.filterbank
         filterbank.forward = torch.compile(filterbank.forward)
