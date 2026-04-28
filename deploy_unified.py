@@ -57,6 +57,18 @@ def slugify(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
 
 
+def strip_env_quotes(value: str) -> str:
+    """Strip surrounding single or double quotes from env var values.
+
+    Some shells (fish) or .env parsers may include literal quotes in values.
+    Docker --env-file does NOT strip quotes, so 'password' becomes literally
+    'password' (with quotes) inside the container.
+    """
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
 def check_common_env():
     required = ["DOCKER_USER", "HF_TOKEN"]
     missing = [v for v in required if not os.getenv(v)]
@@ -378,8 +390,7 @@ class NebiusProvider(CloudProvider):
         ssh_keys = get_ssh_public_keys()
         env_file_lines = []
         for k, v in env.items():
-            env_file_lines.append(f"{k}={shlex.quote(str(v))}")
-
+            env_file_lines.append(f"{k}={v}")
         env_file_content = "\n".join(env_file_lines)
         env_file_block = "\n".join('      ' + line for line in env_file_content.splitlines())
 
@@ -731,13 +742,20 @@ def main():
     parser = argparse.ArgumentParser(description="Unified vLLM Voice Agent Deployment")
     parser.add_argument("--provider", type=str, choices=list(PROVIDER_MAP.keys()),
                         default="nebius", help="Cloud provider to use")
-    parser.add_argument("--model", type=str, default="Qwen/Qwen3.5-27B-FP8",
+    parser.add_argument("--model", type=str, default="Intel/Qwen3.6-27B-int4-AutoRound",
                         help="HuggingFace model repo")
     parser.add_argument("--image", type=str, default=None,
                         help="Docker image (default: $DOCKER_USER/qwen_vllm:latest)")
     parser.add_argument("--tts-backend", type=str, default="qwen3tts_openai",
                         choices=["qwen3tts_openai", "qwen3tts", "cosyvoice3", "qwen3tts_custom"],
                         help="TTS backend")
+    parser.add_argument("--tts-model", type=str, default=None,
+                        help="TTS model override. Defaults depend on --tts-backend: "
+                             "qwen3tts_openai -> Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice "
+                             "(or Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice for larger), "
+                             "qwen3tts -> Qwen/Qwen3-TTS-12Hz-0.6B-Base, "
+                             "cosyvoice3 -> FunAudioLLM/Fun-CosyVoice3-0.5B-2512, "
+                             "qwen3tts_custom -> Qwen/Qwen3-TTS-12Hz-0.6B-Base")
     parser.add_argument("--gpu", type=str, default="NVIDIA H200", help="RunPod GPU type")
     parser.add_argument("--platform", type=str, default="gpu-h200-sxm", help="Nebius platform")
     parser.add_argument("--preset", type=str, default="1gpu-16vcpu-200gb", help="Nebius preset")
@@ -760,13 +778,16 @@ def main():
         "HF_HOME": "/workspace/huggingface",
         "VLLM_ATTENTION_BACKEND": "FLASHINFER",
         "HF_TOKEN": os.getenv("HF_TOKEN"),
+        "LLM_MODEL": args.model,
         "TTS_BACKEND": args.tts_backend,
         "STT_PROVIDER": "silero_cohere",
-        "SILERO_MIN_SILENCE_MS": "400",
+        "TTS_MODEL": args.tts_model or "",
+        "SILERO_EAGER_SILENCE_MS": "500",
+        "SILERO_FINAL_SILENCE_MS": "700",
         "ANY_LLM_SERVER_URL": "http://localhost:8000/v1",
-        "SIP_USER": os.getenv("SIP_USER", ""),
-        "SIP_PASSWORD": os.getenv("SIP_PASSWORD", ""),
-        "SIP_GATEWAY": os.getenv("SIP_GATEWAY", ""),
+        "SIP_USER": strip_env_quotes(os.getenv("SIP_USER", "")),
+        "SIP_PASSWORD": strip_env_quotes(os.getenv("SIP_PASSWORD", "")),
+        "SIP_GATEWAY": strip_env_quotes(os.getenv("SIP_GATEWAY", "")),
     }
     env["JWT_SECRET_KEY"] = secrets.token_hex(32)
     env["ADMIN_USER"] = "admin_" + secrets.token_hex(4)

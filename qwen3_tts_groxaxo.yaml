@@ -50,4 +50,4 @@ optimization:
     # At 12Hz codec rate: 1 frame = ~83ms audio, 2 = ~167ms, 6 = ~500ms.
     # Lower = lower TTFA (time to first audio), higher = better RTF.
     # 2 gives ~167ms audio chunks with very low TTFA.
-    emit_every_frames: 2
+    emit_every_frames: 1

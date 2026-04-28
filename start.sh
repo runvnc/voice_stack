@@ -9,6 +9,8 @@
 #                 Default qwen3tts_openai: Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
 #                 Default qwen3tts:        Qwen/Qwen3-TTS-12Hz-0.6B-Base
 #                 Default cosyvoice3: FunAudioLLM/Fun-CosyVoice3-0.5B-2512
+#   LLM_MODEL     Override the default LLM model.
+#                 Default: Intel/Qwen3.6-27B-int4-AutoRound
 #
 # Usage (RunPod pod environment variables):
 #   TTS_BACKEND=qwen3tts_openai      -> runs groxaxo OpenAI-FastAPI server (default, port 8880, lowest latency)
@@ -19,6 +21,10 @@
 set -e
 
 mkdir -p /workspace/logs
+
+# LLM model selection - override via RunPod env var LLM_MODEL
+export LLM_MODEL=${LLM_MODEL:-Intel/Qwen3.6-27B-int4-AutoRound}
+echo "[start.sh] LLM model: ${LLM_MODEL}"
 
 TTS_BACKEND=${TTS_BACKEND:-qwen3tts_openai}
 

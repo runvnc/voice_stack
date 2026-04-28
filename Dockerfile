@@ -1,9 +1,10 @@
 # =============================================================================
 # Stage 1: Base vLLM image
-# vllm/vllm-openai:v0.18.0 supports Qwen3.5-35B-A3B (Gated DeltaNet MoE)
-# and is the latest release as of 2026-03-28.
+# vllm/vllm-openai:v0.19.1 supports Qwen3.6-35B-A3B (Qwen3-Next hybrid
+# GDN + attention architecture) and is the latest stable release as of
+# 2026-04-18.
 # =============================================================================
-FROM vllm/vllm-openai:v0.18.0 AS base
+FROM vllm/vllm-openai:v0.19.1 AS base
 
 # Clear the base image's ENTRYPOINT so start.sh can be PID 1 via supervisord
 ENTRYPOINT []
@@ -32,14 +33,17 @@ ENV TORCHINDUCTOR_CACHE_DIR=/workspace/torchinductor_cache
 # =============================================================================
 # Stage 2: Install vllm-omni and system dependencies
 #
-# vllm-omni 0.18.0 (PyPI release, 2026-03-28) supports:
+# NOTE: vllm-omni 0.18.0 is INCOMPATIBLE with vllm v0.19.1 (patches
+# vllm.inputs.data which was reorganized). Disabled until a compatible
+# release is available. Only needed for TTS_BACKEND=qwen3tts or cosyvoice3;
+# the default qwen3tts_openai backend does not use vllm-omni.
+#
+# When re-enabling, update to a version compatible with the vllm base image.
+# vllm-omni 0.18.0 supported:
 #   - Qwen3-TTS (all variants)
 #   - CosyVoice3 / Fun-CosyVoice3-0.5B-2512 (added in PR #498)
-# Both TTS backends are available in the same package.
 # =============================================================================
 FROM base AS with-omni
-
-# Configure apt to retry on network failures (Ubuntu mirrors can be flaky)
 RUN echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/99retries && \
     echo 'Acquire::http::Timeout "120";' >> /etc/apt/apt.conf.d/99retries && \
     echo 'Acquire::https::Timeout "120";' >> /etc/apt/apt.conf.d/99retries && \
@@ -51,9 +55,9 @@ RUN echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/99retries && \
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg sox libsox-dev git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Install vllm-omni from PyPI (v0.18.0 is the latest stable release)
-# Both Qwen3-TTS and CosyVoice3 are supported in this release.
-RUN pip install --no-cache-dir vllm-omni==0.18.0
+# DISABLED: vllm-omni incompatible with vllm v0.19.1
+# Re-enable when a compatible version is released.
+# RUN pip install --no-cache-dir vllm-omni==0.19.0
 
 # Install supervisord for process management
 RUN pip install --no-cache-dir supervisor

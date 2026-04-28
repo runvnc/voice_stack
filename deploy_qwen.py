@@ -388,7 +388,7 @@ def main():
     parser = argparse.ArgumentParser(description="Multi-Model RunPod vLLM CLI")
 
     # Model & Image Config
-    parser.add_argument("--model", type=str, default="Qwen/Qwen3.5-27B-FP8",
+    parser.add_argument("--model", type=str, default="Intel/Qwen3.6-27B-int4-AutoRound",
                         help="HuggingFace model repo")
     parser.add_argument("--image", type=str, default=f"{DOCKER_USER}/qwen_vllm:latest",
                         help="Custom Docker image name (default uses DOCKER_USER env var)")
