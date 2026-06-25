@@ -31,33 +31,27 @@ ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ENV TORCHINDUCTOR_CACHE_DIR=/workspace/torchinductor_cache
 
 # =============================================================================
-# Stage 2: Install vllm-omni and system dependencies
-#
-# NOTE: vllm-omni 0.18.0 is INCOMPATIBLE with vllm v0.19.1 (patches
-# vllm.inputs.data which was reorganized). Disabled until a compatible
-# release is available. Only needed for TTS_BACKEND=qwen3tts or cosyvoice3;
-# the default qwen3tts_openai backend does not use vllm-omni.
-#
-# When re-enabling, update to a version compatible with the vllm base image.
-# vllm-omni 0.18.0 supported:
-#   - Qwen3-TTS (all variants)
-#   - CosyVoice3 / Fun-CosyVoice3-0.5B-2512 (added in PR #498)
+# Stage 2: System dependencies + Python packages
 # =============================================================================
-FROM base AS with-omni
+FROM base AS with-deps
 RUN echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/99retries && \
     echo 'Acquire::http::Timeout "120";' >> /etc/apt/apt.conf.d/99retries && \
     echo 'Acquire::https::Timeout "120";' >> /etc/apt/apt.conf.d/99retries && \
+    rm -rf /var/lib/apt/lists/* && \
     sed -i 's|http://archive.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list && \
-    sed -i 's|http://security.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list
+    sed -i 's|http://security.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list && \
+    rm -f /etc/apt/sources.list.d/*deadsnakes*.list /etc/apt/sources.list.d/ppa*.list 2>/dev/null || true
 
-# ffmpeg required by librosa (used internally by vllm-omni for audio)
-# git required for any pip installs from source if needed
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg sox libsox-dev git ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# DISABLED: vllm-omni incompatible with vllm v0.19.1
-# Re-enable when a compatible version is released.
-# RUN pip install --no-cache-dir vllm-omni==0.19.0
+# Refresh keys first, then install.  --allow-unauthenticated is only used
+# to bootstrap ca-certificates / keyrings if the base image keys are stale.
+RUN rm -rf /var/lib/apt/lists/* && \
+    apt-get update -o Acquire::AllowInsecureRepositories=true || true && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated ca-certificates curl gnupg2 ubuntu-keyring || true && \
+    (curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/3bf863cc.pub | gpg --dearmor -o /usr/share/keyrings/cuda-archive-keyring.gpg 2>/dev/null || true) && \
+    (sed -i 's|deb https://developer.download.nvidia.com|deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com|g' /etc/apt/sources.list.d/*.list 2>/dev/null || true) && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends ffmpeg sox libsox-dev git ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
 # Install supervisord for process management
 RUN pip install --no-cache-dir supervisor
@@ -70,9 +64,10 @@ RUN pip install --no-cache-dir supervisor
 RUN pip install --no-cache-dir \
     websockets>=12.0 \
     soundfile \
-    librosa \
-    openai-whisper \
-    "qwen-tts @ git+https://github.com/dffdeeq/Qwen3-TTS-streaming.git"
+    librosa
+# qwen-tts commented out - not needed for kyutai backend
+#    openai-whisper \
+#    "qwen-tts @ git+https://github.com/dffdeeq/Qwen3-TTS-streaming.git"
 
 # Install flash-attn for the custom TTS server (vllm image has CUDA/torch already)
 RUN git clone https://github.com/runvnc/qwen3tts.git /app/qwen3tts_server
@@ -82,8 +77,33 @@ RUN git clone https://github.com/runvnc/qwen3tts.git /app/qwen3tts_server
 # https://github.com/groxaxo/Qwen3-TTS-Openai-Fastapi
 # Runs on port 8880 (HTTP), selected via TTS_BACKEND=qwen3tts_openai
 # =============================================================================
-RUN pip install --no-cache-dir \
-    "qwen-tts[api] @ git+https://github.com/groxaxo/Qwen3-TTS-Openai-Fastapi.git"
+# qwen-tts commented out - not needed for kyutai backend
+# RUN pip install --no-cache-dir \
+#     "qwen-tts[api] @ git+https://github.com/groxaxo/Qwen3-TTS-Openai-Fastapi.git"
+
+# =============================================================================
+# Stage 3b2: Install Kyutai TTS 1.6B (moshi) for incremental streaming TTS
+# https://github.com/kyutai-labs/moshi
+# Runs on port 8765 (TCP), selected via TTS_BACKEND=kyutai
+# Requires 24GB+ GPU VRAM (H200 has 141GB).
+#
+# IMPORTANT: install moshi/Kyutai into its own venv. moshi currently requires
+# torch<2.10 and can downgrade torch/aiohttp/huggingface-hub if installed into
+# the base vLLM environment, breaking vllm 0.19.1 which requires torch==2.10.0
+# and aiohttp>=3.13.3. The Kyutai supervisord commands below use this venv.
+# =============================================================================
+RUN python3 -m venv /opt/kyutai-venv --system-site-packages && \
+    /opt/kyutai-venv/bin/pip install --no-cache-dir \
+        "torch<2.10,>=2.2.0" \
+        moshi \
+        websockets \
+        msgpack && \
+    /opt/kyutai-venv/bin/python - <<'PY'
+import torch, moshi, websockets, msgpack
+print('[kyutai-venv] torch', torch.__version__, 'cuda', torch.version.cuda, 'cuda_available', torch.cuda.is_available())
+print('[kyutai-venv] moshi OK')
+PY
+
 # scipy for Whisper resampling in voice registration, openai-whisper for auto-transcription
 RUN pip install --no-cache-dir scipy openai-whisper
 
@@ -111,7 +131,11 @@ RUN pip install --no-cache-dir flash_attn_3 \
 # =============================================================================
 RUN pip install --no-cache-dir \
     silero-vad \
-    accelerate
+    accelerate \
+    "onnxruntime-gpu[cuda,cudnn]>=1.21,<1.23" \
+    huggingface_hub \
+    soxr
+
 # Pin transformers to 4.57.3 - required by qwen-tts (groxaxo TTS backend)
 RUN pip install --no-cache-dir "transformers==4.57.3"
 
@@ -121,14 +145,17 @@ RUN pip install --no-cache-dir "transformers==4.57.3"
 # Only transformers (and its direct deps) are overridden in this venv.
 # =============================================================================
 RUN python3 -m venv /opt/cohere-venv --system-site-packages && \
-    /opt/cohere-venv/bin/pip install --no-cache-dir "transformers>=5.4.0" sentencepiece protobuf
+    /opt/cohere-venv/bin/pip install --no-cache-dir "transformers>=5.4.0" sentencepiece protobuf && \
+    /opt/cohere-venv/bin/pip install --no-cache-dir \
+        "nano-cohere-transcribe @ git+https://github.com/Deep-unlearning/nano-cohere-transcribe.git"
 
 # =============================================================================
 # Stage 4: Final image - copy configs and set up runtime
 # =============================================================================
-FROM with-omni AS final
+FROM with-deps AS final
 
 COPY cohere_transcribe_server.py /app/cohere_transcribe_server.py
+COPY nano_cohere_transcribe_server.py /app/nano_cohere_transcribe_server.py
 
 # Copy supervisord base config (LLM section only; TTS section added at runtime)
 COPY supervisord_base.conf /etc/supervisord_base.conf
@@ -181,8 +208,10 @@ RUN mkdir -p /app/imgs /app/data/chat /app/models /app/static/personas \
 
 WORKDIR /app
 
-# Create isolated venv and install Mindroot from PyPI
-RUN python3 -m venv /app/.venv && \
+# Create Mindroot venv and install Mindroot from PyPI.
+# --system-site-packages lets the MindRoot process see the base vLLM/PyTorch CUDA stack,
+# reducing the chance that onnxruntime-gpu in the venv cannot find CUDA/cuDNN libs.
+RUN python3 -m venv /app/.venv --system-site-packages && \
     /app/.venv/bin/pip install --no-cache-dir mindroot
 
 # Pre-install plugins at build time
@@ -192,17 +221,61 @@ RUN /app/.venv/bin/mindroot plugin install \
     runvnc/mr_qwen3tts \
     runvnc/mr_any_llm
 
+# mr_sip now keeps the heavy local STT dependencies optional so lightweight
+# Deepgram installs do not pull the CUDA/NVIDIA/Silero stack.  This container
+# runs local SIP STT by default (STT_PROVIDER=smart_turn_v3 below), so install
+# the mr_sip local-STT extra explicitly inside Mindroot's isolated venv.
+#
+# If this image is changed to STT_PROVIDER=silero_cohere only, the smaller
+# extra also works:
+#   /app/.venv/bin/pip install --no-cache-dir \
+#       "mr_sip[silero-cohere] @ git+https://github.com/runvnc/mr_sip.git"
+RUN /app/.venv/bin/pip install --no-cache-dir \
+    "mr_sip[smart-turn-v3] @ git+https://github.com/runvnc/mr_sip.git"
+
+# Install mr_kyutai plugin for Kyutai TTS 1.6B incremental streaming
+RUN /app/.venv/bin/mindroot plugin install runvnc/mr_kyutai
+
+
 # Mindroot env vars - all backend services on localhost (eliminates network round trip)
 ENV ANY_LLM_SERVER_URL=http://localhost:8000/v1
 ENV MR_QWEN3TTS_BACKEND=openai
 ENV MR_QWEN3TTS_OPENAI_URL=http://localhost:8880
-ENV STT_PROVIDER=silero_cohere
+ENV STT_PROVIDER=smart_turn_v3
+ENV REQUIRE_DEEPGRAM=false
+ENV ANY_LLM_API_KEY=NA
 ENV COHERE_TRANSCRIBE_URL=http://localhost:8881
 ENV SILERO_MIN_SILENCE_MS=400
+ENV SILERO_SPEECH_PAD_MS=0
+ENV SMART_TURN_DEVICE=cuda
+ENV SMART_TURN_MODEL_FILENAME=smart-turn-v3.2-gpu.onnx
+ENV SMART_TURN_CUDA_PREFLIGHT=1
+ENV SMART_TURN_THRESHOLD=0.75
+ENV SMART_TURN_SEMANTIC_CHECK_SILENCE_MS=384
+ENV SMART_TURN_FINAL_CONFIRM_SILENCE_MS=640
+ENV SMART_TURN_MAX_SILENCE_POLL_MS=1500
+ENV CUDA_VISIBLE_DEVICES=0
+# Kyutai TTS env vars (used when TTS_BACKEND=kyutai)
+ENV KYUTAI_REMOTE=tcp://localhost:8765
+ENV MR_KYUTAI_REALTIME_STREAM=1
+ENV MR_KYUTAI_HF_REPO=kyutai/tts-1.6b-en_fr
 ENV ANY_LLM_EXTRA_PARAMS='{"extra_body": {"chat_template_kwargs": {"enable_thinking": false}}}'
+# Disable asyncio debug mode (production default)
+ENV MR_ASYNCIO_DEBUG=0
+# Enable SIP call recording
+ENV SIP_ENABLE_RECORDING=true
 # Credentials - override at runtime via RunPod env vars
 ENV JWT_SECRET_KEY=change_me_at_runtime
 ENV ADMIN_USER=admin
 ENV ADMIN_PASS=change_me_at_runtime
 
+# Install ONNX Runtime CUDA + dependencies in Mindroot venv for smart_turn_v3 STT.
+# Pin to modern CUDA12/cuDNN9-era ORT and install ORT's CUDA/cuDNN extras so the
+# venv can run CUDA EP even if it cannot see every base-image library.
+RUN /app/.venv/bin/pip install --no-cache-dir \
+    "onnxruntime-gpu[cuda,cudnn]>=1.21,<1.23" \
+    transformers \
+    soxr
+
+COPY check_smart_turn_cuda.py /app/check_smart_turn_cuda.py
 EXPOSE 8010

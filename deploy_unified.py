@@ -38,11 +38,17 @@ POD_STATE_FILE = Path(__file__).parent / "pod_state.json"
 
 def load_state() -> dict:
     if STATE_FILE.exists():
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            pass
     if POD_STATE_FILE.exists():
-        with open(POD_STATE_FILE, "r") as f:
-            return json.load(f)
+        try:
+            with open(POD_STATE_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            pass
     return {}
 
 
@@ -67,6 +73,44 @@ def strip_env_quotes(value: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
         return value[1:-1]
     return value
+
+
+def is_h100_gpu_name(value: str) -> bool:
+    """Return True if a RunPod GPU id or Nebius platform name looks like H100."""
+    return "h100" in (value or "").lower()
+
+
+def nebius_platform_from_gpu(gpu: str) -> str:
+    """Map a friendly --gpu value to a Nebius platform id.
+
+    Nebius calls this field "platform" while RunPod calls the equivalent choice
+    "gpu". Accept either a full Nebius platform id (gpu-h100-sxm) or a friendly
+    GPU name (H100/H200/NVIDIA H100/NVIDIA H200).
+    """
+    g = (gpu or "").strip()
+    gl = g.lower()
+    if gl.startswith("gpu-"):
+        return g
+    if "h100" in gl:
+        return "gpu-h100-sxm"
+    if "h200" in gl:
+        return "gpu-h200-sxm"
+    return g or "gpu-h200-sxm"
+
+
+def apply_gpu_sizing_defaults(env: Dict[str, str], gpu_name: str) -> None:
+    """Set conservative container sizing defaults for smaller GPUs.
+
+    H100 80GB cannot run the current vLLM 0.85/32k/64seq profile plus Kyutai and
+    STT at the same time. These env vars are read by start.sh/supervisord.
+    Do not overwrite explicit user env vars if already set in the shell.
+    """
+    if is_h100_gpu_name(gpu_name):
+        env.setdefault("VLLM_GPU_MEMORY_UTILIZATION", os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.60"))
+        env.setdefault("VLLM_MAX_MODEL_LEN", os.getenv("VLLM_MAX_MODEL_LEN", "16384"))
+        env.setdefault("VLLM_MAX_NUM_BATCHED_TOKENS", os.getenv("VLLM_MAX_NUM_BATCHED_TOKENS", "8192"))
+        env.setdefault("VLLM_MAX_NUM_SEQS", os.getenv("VLLM_MAX_NUM_SEQS", "16"))
+        env.setdefault("MR_KYUTAI_BATCH_SIZE", os.getenv("MR_KYUTAI_BATCH_SIZE", "1"))
 
 
 def check_common_env():
@@ -268,7 +312,7 @@ class RunPodProvider(CloudProvider):
                 try:
                     import requests
                     r = requests.get(url, timeout=5)
-                    if r.status_code == 200:
+                    if r.status_code and r.status_code not in (502, 503, 504):  # any valid HTTP response except proxy errors
                         return True
                 except Exception:
                     pass
@@ -522,6 +566,7 @@ runcmd:
             ("tcp-api-2", 2, [8881, 8010, 22], "ingress"),
             ("udp-all-in", 3, [], "ingress"),
             ("tcp-web-out", 2, [80, 443], "egress"),
+            ("tcp-postgres-out", 2, [5432], "egress"),
             ("udp-all-out", 3, [], "egress"),
         ]
 
@@ -556,13 +601,15 @@ runcmd:
         from nebius.api.nebius.compute.v1 import (
             CreateInstanceRequest, InstanceSpec, ResourcesSpec,
             AttachedDiskSpec, ManagedDisk, NetworkInterfaceSpec,
-            SecurityGroup,
+            SecurityGroup, PreemptibleSpec, InstanceRecoveryPolicy,
         )
         from nebius.api.nebius.common.v1 import ResourceMetadata
 
         platform = hardware_config.get("platform", "gpu-h200-sxm")
         preset = hardware_config.get("preset", "1gpu-16vcpu-200gb")
         disk_gb = hardware_config.get("disk_gb", 200)
+        preemptible = hardware_config.get("preemptible", False)
+        preemptible_spec = None
 
         print(f"Deploying on Nebius: {platform}/{preset}")
         print(f"Image: {image}")
@@ -580,6 +627,13 @@ runcmd:
         pub_ip = self.PublicIPAddress()
         pub_ip.static = True
         ip_addr = self.IPAddress()
+
+        if preemptible:
+            preemptible_spec = PreemptibleSpec()
+            preemptible_spec.on_preemption = 1  # STOP
+            recovery_policy = 1  # FAIL - required for preemptible VMs
+            print("Using preemptible VM (on_preemption=STOP, recovery_policy=FAIL)")
+            print("Using preemptible VM (on_preemption=STOP)")
 
         req = CreateInstanceRequest(
             metadata=ResourceMetadata(name=name, parent_id=self.project_id),
@@ -602,8 +656,13 @@ runcmd:
                     )
                 ],
                 cloud_init_user_data=cloud_init,
+                preemptible=preemptible_spec,
             ),
         )
+        if preemptible:
+            # Only set recovery_policy for preemptible VMs (FAIL=1)
+            # Non-preemptible VMs should use the API default
+            req.spec.recovery_policy = 1
 
         op = self._instance_svc().create(req).wait()
         instance_id = op.resource_id
@@ -718,7 +777,7 @@ runcmd:
                     try:
                         import requests
                         r = requests.get(llm_url, timeout=5)
-                        if r.status_code == 200:
+                        if r.status_code and r.status_code not in (502, 503, 504):  # any valid HTTP response except proxy errors
                             return True
                     except Exception:
                         pass
@@ -746,8 +805,8 @@ def main():
                         help="HuggingFace model repo")
     parser.add_argument("--image", type=str, default=None,
                         help="Docker image (default: $DOCKER_USER/qwen_vllm:latest)")
-    parser.add_argument("--tts-backend", type=str, default="qwen3tts_openai",
-                        choices=["qwen3tts_openai", "qwen3tts", "cosyvoice3", "qwen3tts_custom"],
+    parser.add_argument("--tts-backend", type=str, default="kyutai_batched",
+                        choices=["qwen3tts_openai", "qwen3tts", "cosyvoice3", "qwen3tts_custom", "kyutai", "kyutai_batched"],
                         help="TTS backend")
     parser.add_argument("--tts-model", type=str, default=None,
                         help="TTS model override. Defaults depend on --tts-backend: "
@@ -755,11 +814,13 @@ def main():
                              "(or Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice for larger), "
                              "qwen3tts -> Qwen/Qwen3-TTS-12Hz-0.6B-Base, "
                              "cosyvoice3 -> FunAudioLLM/Fun-CosyVoice3-0.5B-2512, "
-                             "qwen3tts_custom -> Qwen/Qwen3-TTS-12Hz-0.6B-Base")
-    parser.add_argument("--gpu", type=str, default="NVIDIA H200", help="RunPod GPU type")
-    parser.add_argument("--platform", type=str, default="gpu-h200-sxm", help="Nebius platform")
+                             "qwen3tts_custom -> Qwen/Qwen3-TTS-12Hz-0.6B-Base, "
+                             "kyutai -> kyutai/tts-1.6b-en_fr")
+    parser.add_argument("--gpu", type=str, default="NVIDIA H200", help="GPU type. For RunPod this is the GPU type id/name; for Nebius this may be H100/H200 or a platform id like gpu-h100-sxm.")
+    parser.add_argument("--platform", type=str, default=None, help="Nebius platform alias; deprecated, use --gpu instead")
     parser.add_argument("--preset", type=str, default="1gpu-16vcpu-200gb", help="Nebius preset")
     parser.add_argument("--disk-gb", type=int, default=200, help="Nebius boot disk size in GB")
+    parser.add_argument("--preemptible", action="store_true", help="Create a preemptible VM (Nebius only, cheaper but may be terminated at any time)")
     parser.add_argument("--deploy", action="store_true", help="Deploy a new instance")
     parser.add_argument("--start", action="store_true", help="Start a stopped instance")
     parser.add_argument("--stop", action="store_true", help="Stop a running instance")
@@ -780,7 +841,7 @@ def main():
         "HF_TOKEN": os.getenv("HF_TOKEN"),
         "LLM_MODEL": args.model,
         "TTS_BACKEND": args.tts_backend,
-        "STT_PROVIDER": "silero_cohere",
+        "STT_PROVIDER": "smart_turn_v3",
         "TTS_MODEL": args.tts_model or "",
         "SILERO_EAGER_SILENCE_MS": "500",
         "SILERO_FINAL_SILENCE_MS": "700",
@@ -788,7 +849,20 @@ def main():
         "SIP_USER": strip_env_quotes(os.getenv("SIP_USER", "")),
         "SIP_PASSWORD": strip_env_quotes(os.getenv("SIP_PASSWORD", "")),
         "SIP_GATEWAY": strip_env_quotes(os.getenv("SIP_GATEWAY", "")),
+        "MR_ASYNCIO_DEBUG": "0",
+        "SIP_ENABLE_RECORDING": "true",
     }
+
+    selected_gpu = args.gpu
+    if args.provider == "nebius" and args.platform:
+        selected_gpu = args.platform
+    apply_gpu_sizing_defaults(env, selected_gpu)
+
+    # Only require Deepgram if STT_PROVIDER uses it
+    stt_provider = env["STT_PROVIDER"]
+    if "deepgram" not in stt_provider.lower():
+        env["REQUIRE_DEEPGRAM"] = "false"
+
     env["JWT_SECRET_KEY"] = secrets.token_hex(32)
     env["ADMIN_USER"] = "admin_" + secrets.token_hex(4)
     env["ADMIN_PASS"] = secrets.token_urlsafe(16)
@@ -806,8 +880,11 @@ def main():
     if args.provider == "runpod":
         hardware = {"gpu": args.gpu, "count": 1, "model": args.model}
     else:
-        hardware = {"platform": args.platform, "preset": args.preset,
+        nebius_platform = args.platform or nebius_platform_from_gpu(args.gpu)
+        hardware = {"platform": nebius_platform, "preset": args.preset,
                     "disk_gb": args.disk_gb, "model": args.model}
+        if args.preemptible:
+            hardware["preemptible"] = True
 
     ProviderClass = PROVIDER_MAP[args.provider]
     provider = ProviderClass()
@@ -929,7 +1006,7 @@ def main():
     print(f"  ADMIN_USER: {env['ADMIN_USER']}")
     print(f"  ADMIN_PASS: {env['ADMIN_PASS']}")
 
-    if not provider.wait_for_ready(rid, timeout=1200):
+    if not provider.wait_for_ready(rid, timeout=600):
         print("WARNING: Timed out waiting for ready. Check status manually.")
 
     # Always print info (URLs + creds) after deploy, even on timeout
